@@ -23,6 +23,15 @@ name: Build LibWrt for Redmi AX5 JDCloud (RA50)
 #    · KERNEL_SIZE  6144k -> 可选值（12288k 对齐自建 GPT 的 12M 0:HLOS）
 #    · factory 配方 pad-rootfs|pad-to 64k -> append-metadata（对齐已验证的 B 版）
 #    · DEVICE_PACKAGES 追加你指定的额外软件包
+#
+#  只依赖 GitHub 官方 action：actions/checkout、actions/cache、actions/upload-artifact
+#
+#  ccache 的两个坑（都已在本文件里处理好，别删）：
+#    1) LibWrt 的 Kconfig 写的是 `bool "Use ccache" if DEVEL`
+#       —— 只写 CONFIG_CCACHE=y 会被 `make defconfig` 直接丢弃（符号不可见），
+#       必须同时 CONFIG_DEVEL=y 才会生效。
+#    2) runner 镜像不自带 ccache 命令，需要现场 apt 安装。
+#    想彻底关掉 ccache：跑 workflow 时把 use_ccache 取消勾选即可。
 # =============================================================================
 
 on:
@@ -59,6 +68,10 @@ on:
         description: '额外上传本地 apk 软件源（供设备端 apk add 用，体积较大）'
         type: boolean
         default: false
+      use_ccache:
+        description: '启用 ccache 编译缓存（跨 Run 复用，二次编译显著提速）'
+        type: boolean
+        default: true
   push:
     branches:
       - '25.12-nss'
@@ -88,6 +101,7 @@ jobs:
       ENABLE_OPENCLASH: ${{ inputs.enable_openclash || 'false' }}
       MAKE_JOBS: ${{ inputs.make_jobs || '' }}
       UPLOAD_PKG_REPO: ${{ inputs.upload_packages_repo || 'false' }}
+      USE_CCACHE: ${{ inputs.use_ccache == false && 'false' || 'true' }}
 
     steps:
       # ---------------------------------------------------------------------
@@ -117,6 +131,57 @@ jobs:
           df -h /
           echo "CPU: $(nproc) 核"
           free -h | head -2
+
+      # ---------------------------------------------------------------------
+      # ccache：runner 镜像不自带 ccache 命令，这里现场装（装不上就自动降级为不用）
+      - name: 准备 ccache（可选）
+        run: |
+          # CCACHE_DIR 必须在 set-config 之前导出：配置文件是 $CCACHE_DIR/ccache.conf，
+          # 写错地方会导致 max_size / compiler_check 不生效（compiler_check 用默认的
+          # mtime 时，每次全新 runner 上编译器 mtime 都不同 -> 跨 Run 缓存全部 miss）。
+          # 这个路径与 rules.mk 里 CCACHE_DIR 的默认值（$(TOPDIR)/.ccache）一致。
+          export CCACHE_DIR="$PWD/.ccache"
+
+          if [ "$USE_CCACHE" != "true" ]; then
+            echo "CCACHE_READY=false" >> "$GITHUB_ENV"
+            echo "已按参数关闭 ccache"
+            exit 0
+          fi
+
+          if ! command -v ccache >/dev/null 2>&1; then
+            echo "runner 未预装 ccache，尝试 apt 安装 ..."
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq ccache || true
+          fi
+
+          if command -v ccache >/dev/null 2>&1; then
+            echo "ccache 可用: $(ccache --version | head -1)"
+            ccache --zero-stats || true
+            # 配置写进 $CCACHE_DIR/ccache.conf（随 actions/cache 一起保存）
+            ccache --set-config=max_size=2G || ccache --max-size=2G || true
+            ccache --set-config=compiler_check=content || true
+            echo "--- 生效配置 ---"
+            ccache --show-config 2>/dev/null | grep -E 'cache_dir|max_size|compiler_check' || true
+            {
+              echo "CCACHE_READY=true"
+              echo "CCACHE_DIR=$CCACHE_DIR"
+              echo "CCACHE_MAXSIZE=2G"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::ccache 安装失败，本次编译不使用 ccache（不影响产物正确性）"
+            echo "CCACHE_READY=false" >> "$GITHUB_ENV"
+          fi
+
+      # 跨 Run 复用编译缓存：key 带 run_id 每次新存，restore-keys 前缀命中历史缓存
+      - name: 恢复 ccache 缓存
+        if: env.CCACHE_READY == 'true'
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: .ccache
+          key: ccache-${{ env.SRC_REPO }}-${{ env.SRC_REF }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.SRC_REPO }}-${{ env.SRC_REF }}-
 
       # ---------------------------------------------------------------------
       - name: 计算并行度
@@ -222,7 +287,6 @@ jobs:
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq60xx=y
           CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_redmi_ax5-jdcloud=y
-          CONFIG_CCACHE=y
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_LUCI_LANG_zh_Hans=y
@@ -230,6 +294,24 @@ jobs:
 
           # 中文：必须用 CONFIG_LUCI_LANG_zh_Hans（符号是 zh_Hans 不是 zh-cn），
           # 直接写 CONFIG_PACKAGE_luci-i18n-*-zh-cn=y 会被 defconfig 打回。
+          #
+          # ccache：上游 Kconfig 写的是 `bool "Use ccache" if DEVEL`，
+          # 没开 DEVEL 时该符号不可见，只写 CONFIG_CCACHE=y 会被 defconfig 直接丢掉。
+          # 打开 DEVEL 会连带把几个 `if DEVEL` 的默认值写出来，这里把两个有构建
+          # 意义的钉回关闭态（BPF_TOOLCHAIN 的 choice 默认是 Build-LLVM；虽然它只在
+          # NEED_BPF_TOOLCHAIN 被某个包选中时才真的 select USE_LLVM_BUILD 去编 LLVM，
+          # 仍显式选 None，保证除 ccache 外零配置漂移）。
+          if [ "$CCACHE_READY" = "true" ]; then
+            {
+              echo 'CONFIG_DEVEL=y'
+              echo 'CONFIG_CCACHE=y'
+              echo 'CONFIG_BPF_TOOLCHAIN_NONE=y'
+              echo '# CONFIG_NEED_TOOLCHAIN is not set'
+            } >> .config
+            echo "已启用 ccache（DEVEL=y + CCACHE=y），BPF/NEED_TOOLCHAIN 已钉回关闭"
+          else
+            echo "本次编译不使用 ccache"
+          fi
 
           for p in $EXTRA_PACKAGES; do
             echo "CONFIG_PACKAGE_$p=y" >> .config
@@ -252,8 +334,7 @@ jobs:
           fail=0
           for k in \
             CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_redmi_ax5-jdcloud=y \
-            CONFIG_LUCI_LANG_zh_Hans=y \
-            CONFIG_CCACHE=y ; do
+            CONFIG_LUCI_LANG_zh_Hans=y ; do
             if grep -qx "$k" .config; then
               echo "  [OK]   $k"
             else
@@ -261,6 +342,20 @@ jobs:
               fail=1
             fi
           done
+
+          # ccache 只在启用时才要求（未启用属正常配置，不算失败）
+          if [ "$CCACHE_READY" = "true" ]; then
+            for k in CONFIG_DEVEL=y CONFIG_CCACHE=y; do
+              if grep -qx "$k" .config; then
+                echo "  [OK]   $k"
+              else
+                echo "  [FAIL] $k（ccache 需要 DEVEL + CCACHE 同时为 y）"
+                fail=1
+              fi
+            done
+          else
+            echo "  [SKIP] ccache 未启用，跳过 CONFIG_CCACHE 校验"
+          fi
           for p in $EXTRA_PACKAGES; do
             if grep -qx "CONFIG_PACKAGE_$p=y" .config; then
               echo "  [OK]   CONFIG_PACKAGE_$p=y"
@@ -324,6 +419,12 @@ jobs:
             grep -E 'luci-i18n-.*-zh-cn' "$MANIFEST" | head -20 || true
             echo "--- NSS / qca 驱动 ---"
             grep -iE 'nss|ssdk' "$MANIFEST" | head -30 || true
+          fi
+
+          if [ "$CCACHE_READY" = "true" ]; then
+            echo
+            echo "================ ccache 统计 ================"
+            ccache --show-stats || true
           fi
 
           {
