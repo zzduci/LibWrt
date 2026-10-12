@@ -1,0 +1,400 @@
+name: Build LibWrt for Redmi AX5 JDCloud (RA50)
+
+# =============================================================================
+#  红米 AX5 京东云版（RA50 / ipq6000 / 512M + 64G eMMC）OpenWrt 自动编译
+# -----------------------------------------------------------------------------
+#  这是「单文件」workflow：把本文件放进任意仓库的 .github/workflows/ 就能跑，
+#  不需要额外脚本（补丁逻辑已内联；项目里 ci/ra50_patch.py 是同一份逻辑的
+#  本地可测副本，已在上游真实文件上验证过）。
+#
+#  三步上手
+#    1) 放到一个 **public** 仓库的 .github/workflows/build-libwrt.yml
+#       public 仓库：4 vCPU / 16 GB，免费且不限时长
+#       private 仓库：只有 2 vCPU / 8 GB，还会消耗 Actions 额度（不推荐）
+#    2) push 上去（会自动触发一次），或手动 Actions → Run workflow
+#    3) 编完在 Run 页面底部 Artifacts 下载
+#
+#  产物（bin/targets/qualcommax/ipq60xx/）
+#    *-squashfs-factory.bin      uboot 网页面刷（砖了用这个兜底）
+#    *-squashfs-sysupgrade.bin   已有 OpenWrt 里「刷写固件」或 ssh sysupgrade -n
+#    *.manifest / sha256sums     包清单与校验值
+#
+#  相对上游只改「一个设备块」Device/redmi_ax5-jdcloud，其余机型零改动：
+#    · KERNEL_SIZE  6144k -> 可选值（12288k 对齐自建 GPT 的 12M 0:HLOS）
+#    · factory 配方 pad-rootfs|pad-to 64k -> append-metadata（对齐已验证的 B 版）
+#    · DEVICE_PACKAGES 追加你指定的额外软件包
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源码仓库（默认上游；改成你自己的 fork 则编译你的分支）'
+        type: string
+        default: 'LiBwrt/LibWrt'
+      source_ref:
+        description: '分支 / tag / commit'
+        type: string
+        default: '25.12-nss'
+      kernel_size:
+        description: 'factory 镜像的内核填充值（12288k 对齐 12M HLOS；6144k 为上游原值）'
+        type: choice
+        options:
+          - 12288k
+          - 6144k
+        default: 12288k
+      extra_packages:
+        description: '额外软件包，空格分隔'
+        type: string
+        default: 'openssh-sftp-server vsftpd'
+      enable_openclash:
+        description: '编入 luci-app-openclash（实验性，会拉入 ruby / dnsmasq-full 等一堆依赖）'
+        type: boolean
+        default: false
+      make_jobs:
+        description: '并行度（留空 = CPU 核心数）'
+        type: string
+        default: ''
+      upload_packages_repo:
+        description: '额外上传本地 apk 软件源（供设备端 apk add 用，体积较大）'
+        type: boolean
+        default: false
+  push:
+    branches:
+      - '25.12-nss'
+      - 'main'
+    paths:
+      - '.github/workflows/build-libwrt.yml'
+
+# 同一分支串行，避免两个编译互相抢资源；不自动取消，防止误杀正在跑的任务
+concurrency:
+  group: build-libwrt-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: RA50 ${{ inputs.kernel_size || '12288k' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      SRC_REPO: ${{ inputs.source_repo || 'LiBwrt/LibWrt' }}
+      SRC_REF: ${{ inputs.source_ref || '25.12-nss' }}
+      KERNEL_SIZE: ${{ inputs.kernel_size || '12288k' }}
+      EXTRA_PACKAGES: ${{ inputs.extra_packages || 'openssh-sftp-server vsftpd' }}
+      ENABLE_OPENCLASH: ${{ inputs.enable_openclash || 'false' }}
+      MAKE_JOBS: ${{ inputs.make_jobs || '' }}
+      UPLOAD_PKG_REPO: ${{ inputs.upload_packages_repo || 'false' }}
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          fetch-depth: 1
+
+      # ---------------------------------------------------------------------
+      # 标准 runner 只有 14 GB 磁盘，OpenWrt 全量编译要 25~35 GB，
+      # 必须先清掉预装的重型工具链，否则一定 disk full。
+      - name: 释放磁盘空间
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup || true
+          sudo apt-get clean || true
+          echo "----------------- 清理后 -----------------"
+          df -h /
+          echo "CPU: $(nproc) 核"
+          free -h | head -2
+
+      # ---------------------------------------------------------------------
+      - name: 计算并行度
+        run: |
+          JOBS="${MAKE_JOBS:-$(nproc)}"
+          echo "JOBS=$JOBS" >> "$GITHUB_ENV"
+          echo "并行度 = $JOBS"
+
+      # ---------------------------------------------------------------------
+      - name: 打 RA50 适配补丁
+        run: |
+          python3 - <<'PY'
+          import difflib, os, re, sys
+
+          path = "target/linux/qualcommax/image/ipq60xx.mk"
+          ksize = os.environ["KERNEL_SIZE"].strip()
+          extra = os.environ.get("EXTRA_PACKAGES", "").split()
+          dev = "redmi_ax5-jdcloud"
+          # 与已验证可用的 B 版逐字一致的 factory 配方
+          new_recipe = ("\tIMAGE/factory.bin := append-kernel | pad-to $$(KERNEL_SIZE)"
+                        " | append-rootfs | append-metadata")
+
+          if not re.match(r"^\d+[kKmM]$", ksize):
+              sys.exit("KERNEL_SIZE 非法: %r" % ksize)
+
+          # newline="" 原样保留换行符，避免把整个文件的换行风格改掉
+          with open(path, "r", encoding="utf-8", newline="") as fh:
+              raw = fh.read()
+          nl = "\r\n" if "\r\n" in raw else "\n"
+          lines = raw.split(nl)
+
+          start = end = None
+          for i, line in enumerate(lines):
+              if re.match(r"^define\s+Device/%s\s*$" % re.escape(dev), line):
+                  start = i
+              elif start is not None and re.match(r"^endef\s*$", line):
+                  end = i
+                  break
+          if start is None or end is None:
+              sys.exit("找不到 define Device/%s ... endef" % dev)
+
+          hit_k = hit_f = hit_p = 0
+          found_pkgs = False
+          for i in range(start, end + 1):
+              line = lines[i]
+              if re.match(r"^\s*KERNEL_SIZE\s*:=", line):
+                  lines[i] = "\tKERNEL_SIZE := " + ksize
+                  hit_k += 1
+              elif re.match(r"^\s*IMAGE/factory\.bin\s*:=", line):
+                  lines[i] = new_recipe
+                  hit_f += 1
+              elif re.match(r"^\s*DEVICE_PACKAGES\s*:=", line):
+                  found_pkgs = True
+                  if extra:
+                      have = set(line.split(":=", 1)[1].split())
+                      add = [x for x in extra if x not in have]
+                      if add:
+                          lines[i] = line.rstrip() + " " + " ".join(add)
+                          hit_p += 1
+
+          if hit_k != 1 or hit_f != 1:
+              sys.exit("匹配数异常 KERNEL_SIZE=%d factory=%d，上游结构已变，请人工核对" % (hit_k, hit_f))
+          if extra and not found_pkgs:
+              sys.exit("块内找不到 DEVICE_PACKAGES 行，无法追加额外包")
+
+          new = nl.join(lines)
+          if new == raw:
+              print("[=] 已经是目标状态，无需改动")
+              sys.exit(0)
+
+          with open(path, "w", encoding="utf-8", newline="") as fh:
+              fh.write(new)
+          sys.stdout.write("".join(difflib.unified_diff(
+              raw.splitlines(True), new.splitlines(True),
+              fromfile="a/ipq60xx.mk (上游)", tofile="b/ipq60xx.mk (补丁后)")))
+          print("[+] 补丁已应用  KERNEL_SIZE=%s  追加包=%s" % (ksize, " ".join(extra) or "(无)"))
+          PY
+          echo "---------- 补丁后的设备块 ----------"
+          awk '/^define Device\/redmi_ax5-jdcloud/,/^endef/' target/linux/qualcommax/image/ipq60xx.mk
+          echo "---------- 确认其它机型未被改动 ----------"
+          grep -n 'KERNEL_SIZE :=' target/linux/qualcommax/image/ipq60xx.mk
+
+      # ---------------------------------------------------------------------
+      - name: 拉取 feeds
+        run: |
+          set -o pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          if [ "$ENABLE_OPENCLASH" = "true" ]; then
+            echo "=== 追加 OpenClash feed ==="
+            echo 'src-git openclash https://github.com/vernesong/OpenClash.git' >> feeds.conf.default
+            ./scripts/feeds update openclash
+            ./scripts/feeds install -a -p openclash
+          fi
+          echo "=== feeds 安装完成，可用包数：$(find package/feeds -maxdepth 2 -name Makefile | wc -l) ==="
+
+      # ---------------------------------------------------------------------
+      - name: 生成 .config
+        run: |
+          set -e
+          # --- 最小种子配置，其余交给 make defconfig 自动补齐 ---
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq60xx=y
+          CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_redmi_ax5-jdcloud=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          EOF
+
+          # 中文：必须用 CONFIG_LUCI_LANG_zh_Hans（符号是 zh_Hans 不是 zh-cn），
+          # 直接写 CONFIG_PACKAGE_luci-i18n-*-zh-cn=y 会被 defconfig 打回。
+
+          for p in $EXTRA_PACKAGES; do
+            echo "CONFIG_PACKAGE_$p=y" >> .config
+          done
+
+          if [ "$ENABLE_OPENCLASH" = "true" ]; then
+            {
+              echo 'CONFIG_PACKAGE_luci-app-openclash=y'
+              echo 'CONFIG_PACKAGE_luci-compat=y'
+              echo 'CONFIG_PACKAGE_dnsmasq-full=y'
+              echo 'CONFIG_PACKAGE_kmod-tun=y'
+              echo 'CONFIG_PACKAGE_kmod-inet-diag=y'
+              echo 'CONFIG_PACKAGE_kmod-nft-tproxy=y'
+            } >> .config
+          fi
+
+          make defconfig
+
+          echo "================ 关键项落地校验 ================"
+          fail=0
+          for k in \
+            CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_redmi_ax5-jdcloud=y \
+            CONFIG_LUCI_LANG_zh_Hans=y \
+            CONFIG_CCACHE=y ; do
+            if grep -qx "$k" .config; then
+              echo "  [OK]   $k"
+            else
+              echo "  [FAIL] $k"
+              fail=1
+            fi
+          done
+          for p in $EXTRA_PACKAGES; do
+            if grep -qx "CONFIG_PACKAGE_$p=y" .config; then
+              echo "  [OK]   CONFIG_PACKAGE_$p=y"
+            else
+              echo "  [WARN] CONFIG_PACKAGE_$p=y 未生效（可能是不存在的包名）"
+            fi
+          done
+          [ "$fail" = 0 ] || { echo "::error::关键配置未生效，终止"; exit 1; }
+
+          echo
+          echo "================ 目标与版本 ================"
+          grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|ARCH_PACKAGES)|^CONFIG_TARGET_qualcommax=y' .config || true
+
+      # ---------------------------------------------------------------------
+      - name: 下载依赖源码包
+        run: |
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "===== make download 第 $i 次 ====="
+            if make -j"$JOBS" download; then ok=1; break; fi
+            echo "::warning::download 第 $i 次失败，重试"
+            sleep 5
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::源码包连续 5 次下载失败，退出"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      - name: 编译
+        run: |
+          set -o pipefail
+          echo "开始编译，并行度 $JOBS，时间 $(date -Is)"
+          if ! make -j"$JOBS"; then
+            echo "::warning::并行编译失败，改用详细输出重试（下面只保留尾部 300 行）"
+            make -j"$JOBS" V=s 2>&1 | tail -n 300
+          fi
+          echo "编译结束，时间 $(date -Is)"
+
+      # ---------------------------------------------------------------------
+      - name: 校验与汇总
+        run: |
+          set -e
+          OUT=bin/targets/qualcommax/ipq60xx
+          echo "================ 产物 ================"
+          ls -lh "$OUT"
+
+          ( cd "$OUT" && sha256sum *.bin *.manifest > SHA256SUMS.txt 2>/dev/null || true )
+          echo
+          echo "================ sha256 ================"
+          cat "$OUT/SHA256SUMS.txt" 2>/dev/null || true
+
+          MANIFEST=$(ls "$OUT"/*.manifest 2>/dev/null | head -1 || true)
+          echo
+          echo "================ manifest 摘要 ================"
+          if [ -n "$MANIFEST" ]; then
+            echo "包总数: $(wc -l < "$MANIFEST")"
+            echo "--- kernel / libc ---"
+            grep -E '^(kernel|libc|libgcc|base-files|busybox) ' "$MANIFEST" || true
+            echo "--- 中文 LuCI ---"
+            grep -E 'luci-i18n-.*-zh-cn' "$MANIFEST" | head -20 || true
+            echo "--- NSS / qca 驱动 ---"
+            grep -iE 'nss|ssdk' "$MANIFEST" | head -30 || true
+          fi
+
+          {
+            echo "## RA50 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 源码 | \`$SRC_REPO\` @ \`$SRC_REF\` |"
+            echo "| commit | \`$(git rev-parse --short HEAD 2>/dev/null || echo n/a)\` |"
+            echo "| KERNEL_SIZE | \`$KERNEL_SIZE\` |"
+            echo "| 额外包 | \`${EXTRA_PACKAGES:-（无）}\` |"
+            echo "| OpenClash | \`$ENABLE_OPENCLASH\` |"
+            echo "| 并行度 | \`$JOBS\` |"
+            echo ""
+            echo "### 产物"
+            echo '```'
+            ls -lh "$OUT"
+            echo '```'
+            echo ""
+            echo "### 产物 sha256"
+            echo '```'
+            cat "$OUT/SHA256SUMS.txt" 2>/dev/null || echo "n/a"
+            echo '```'
+            if [ -n "$MANIFEST" ]; then
+              echo ""
+              echo "<details><summary>manifest 关键摘要（点击展开）</summary>"
+              echo ""
+              echo '```'
+              echo "包总数: $(wc -l < "$MANIFEST")"
+              grep -E '^(kernel|libc) ' "$MANIFEST" || true
+              grep -E 'luci-i18n-base-zh-cn' "$MANIFEST" || true
+              grep -icE 'nss|ssdk' "$MANIFEST" | sed 's/^/NSS 相关包数: /'
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwrt-ra50-${{ env.KERNEL_SIZE }}-${{ github.run_number }}
+          path: |
+            bin/targets/qualcommax/ipq60xx/*.bin
+            bin/targets/qualcommax/ipq60xx/*.manifest
+            bin/targets/qualcommax/ipq60xx/sha256sums
+            bin/targets/qualcommax/ipq60xx/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传本地 apk 软件源（可选）
+        if: env.UPLOAD_PKG_REPO == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwrt-ra50-apk-repo-${{ github.run_number }}
+          path: |
+            bin/targets/qualcommax/ipq60xx/packages/
+            bin/packages/aarch64_cortex-a53/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
+
+      # 失败时把关键信息再吐一遍，省得翻几千行日志
+      - name: 失败诊断
+        if: failure()
+        run: |
+          echo "===== 磁盘 ====="; df -h / || true
+          echo "===== 内存 ====="; free -h || true
+          echo "===== 失败标记 ====="
+          find build_dir -name '*.failed' 2>/dev/null | head -20 || true
+          echo "===== 最近的日志尾部 ====="
+          find logs -name '*.txt' -newermt '-30 minutes' 2>/dev/null | head -5 | while read -r f; do
+            echo "--- $f ---"; tail -n 40 "$f"
+          done
